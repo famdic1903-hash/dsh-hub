@@ -2625,11 +2625,14 @@ class WechatRuntime {
         const naming = await this.#isFirstMessage(decision.sessionId);
         // 渠道提示只保留标识，具体规范由 wechat-channel 技能负责。
         const presenceNote = settings.presenceNote === '' ? '' : '[渠道：微信]';
-        // v8：记录“提交时该会话已有的回合号”，用于区分新回合（微信发起）与插话（桌面回合）。
-        this.#wechatTurns.set(decision.sessionId, {
+        // v9：提交时若已有回合在跑，则把该回合标记为“微信参与”（插话也回微信）；否则等待下一个新回合。
+        const sessionNow = decision.sessionId;
+        const activeNow = this.#activeTurn.get(sessionNow);
+        this.#wechatTurns.set(sessionNow, {
             pendingAt: Date.now(),
-            prevTurn: this.#activeTurn.get(decision.sessionId),
+            prevTurn: activeNow,
             turn: undefined,
+            steerTurn: activeNow,
             at: Date.now(),
         });
         /*
@@ -2936,9 +2939,12 @@ class WechatRuntime {
      */
     #isWechatOriginTurn(sessionId) {
         const track = this.#wechatTurns.get(sessionId);
-        if (track === undefined || track.turn === undefined)
+        if (track === undefined)
             return false;
-        return track.turn === this.#activeTurn.get(sessionId);
+        const active = this.#activeTurn.get(sessionId);
+        if (active === undefined)
+            return false;
+        return track.turn === active || track.steerTurn === active;
     }
     /**
      * Feed one assistant stream frame into the reply buffer.
@@ -2952,7 +2958,7 @@ class WechatRuntime {
         const { sessionId, text, completed, chunkType, frameShape } = readStreamFrame(payload);
         if (sessionId === undefined)
             return;
-        // v8：用回合号判断来源——只有微信发起的新回合才推送回复/审批；桌面回合完全不推微信。
+        // v9：回合来源判断——微信发起的回合、以及被微信插话的回合都推微信；纯桌面回合不推。
         const rawTurn = payload && payload.frame ? payload.frame.turn : undefined;
         const frameTurn = typeof rawTurn === 'number' ? rawTurn : undefined;
         if (frameTurn !== undefined)
@@ -2960,13 +2966,26 @@ class WechatRuntime {
         const sourceTrack = this.#wechatTurns.get(sessionId);
         let wechatOrigin = false;
         if (sourceTrack !== undefined) {
-            if (sourceTrack.turn !== undefined) {
-                wechatOrigin = frameTurn === undefined || frameTurn === sourceTrack.turn;
+            if (frameTurn !== undefined) {
+                if (sourceTrack.steerTurn !== undefined && sourceTrack.steerTurn === frameTurn) {
+                    // 微信消息是在这个已在运行的回合里插话的
+                    wechatOrigin = true;
+                }
+                else if (sourceTrack.turn === frameTurn) {
+                    wechatOrigin = true;
+                }
+                else if (sourceTrack.turn === undefined && Date.now() - sourceTrack.pendingAt < 60 * 1000 &&
+                    frameTurn !== sourceTrack.prevTurn) {
+                    // 提交后出现的新回合 = 微信发起的回合
+                    sourceTrack.turn = frameTurn;
+                    wechatOrigin = true;
+                }
+                else {
+                    // 新的、非微信回合（桌面发起）——不再推送并清掉跟踪
+                    this.#wechatTurns.delete(sessionId);
+                }
             }
-            else if (sourceTrack.pendingAt !== null && Date.now() - sourceTrack.pendingAt < 60 * 1000 &&
-                frameTurn !== undefined && frameTurn !== sourceTrack.prevTurn) {
-                // 提交后出现的新回合 = 微信发起的回合
-                sourceTrack.turn = frameTurn;
+            else if (sourceTrack.turn !== undefined || sourceTrack.steerTurn !== undefined) {
                 wechatOrigin = true;
             }
             if (wechatOrigin)
