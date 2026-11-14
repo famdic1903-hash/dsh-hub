@@ -345,6 +345,8 @@ class WechatRuntime {
      * 桌面端与微信共用一个会话，但只有微信发起的回合，回复才转发到手机。
      */
     #wechatTurns = new Map();
+    /** 每个会话当前 assistant stream 的回合号（v8 来源判断用）。 */
+    #activeTurn = new Map();
     /** Recent errors, surfaced in the settings page. */
     #errors = [];
     /** Non-text messages awaiting an instruction, keyed by conversation. */
@@ -1600,8 +1602,7 @@ class WechatRuntime {
                 `${conversationId === undefined ? 'not-a-wechat-session -> delegate' : 'claiming'}`);
             if (conversationId === undefined)
                 return await next();
-            const originOnly = this.#settingsNow().originOnly !== false;
-            if (sessionId === undefined || (originOnly && !this.#wechatTurns.has(sessionId))) {
+            if (sessionId === undefined || !this.#isWechatOriginTurn(sessionId)) {
                 // 电脑端发起的回合：授权/提问交回电脑弹窗，不送到微信。
                 this.#recordBoot(`delegated to desktop: session ${String(sessionId)} was not started from WeChat`);
                 return await next();
@@ -1634,8 +1635,7 @@ class WechatRuntime {
                 `${conversationId === undefined ? 'not-a-wechat-session -> delegate' : 'claiming'}`);
             if (conversationId === undefined)
                 return await next();
-            const originOnly = this.#settingsNow().originOnly !== false;
-            if (sessionId === undefined || (originOnly && !this.#wechatTurns.has(sessionId))) {
+            if (sessionId === undefined || !this.#isWechatOriginTurn(sessionId)) {
                 // 电脑端发起的回合：授权/提问交回电脑弹窗，不送到微信。
                 this.#recordBoot(`delegated to desktop: session ${String(sessionId)} was not started from WeChat`);
                 return await next();
@@ -2625,9 +2625,13 @@ class WechatRuntime {
         const naming = await this.#isFirstMessage(decision.sessionId);
         // 渠道提示只保留标识，具体规范由 wechat-channel 技能负责。
         const presenceNote = settings.presenceNote === '' ? '' : '[渠道：微信]';
-        // 只有本通道发起的回合才在 onAssistantFrame 里被转发到微信（桌面端发起的不转发）。
-        // v4: 记录 at + 本回合 turn 号（首帧补全），避免一个回合内多次 end 帧把标记提前删掉。
-        this.#wechatTurns.set(decision.sessionId, { at: Date.now(), turn: undefined });
+        // v8：记录“提交时该会话已有的回合号”，用于区分新回合（微信发起）与插话（桌面回合）。
+        this.#wechatTurns.set(decision.sessionId, {
+            pendingAt: Date.now(),
+            prevTurn: this.#activeTurn.get(decision.sessionId),
+            turn: undefined,
+            at: Date.now(),
+        });
         /*
          * Say so before anything else when the conversation had to be moved.
          *
@@ -2927,6 +2931,16 @@ class WechatRuntime {
         this.#recordBoot(line);
     }
     /**
+     * v8：当前会话是否正在跑一个“微信发起的回合”。
+     * 审批/选择题用它在微信与桌面之间分流。
+     */
+    #isWechatOriginTurn(sessionId) {
+        const track = this.#wechatTurns.get(sessionId);
+        if (track === undefined || track.turn === undefined)
+            return false;
+        return track.turn === this.#activeTurn.get(sessionId);
+    }
+    /**
      * Feed one assistant stream frame into the reply buffer.
      *
      * DSH emits deltas as the model generates. Batching them behind a short quiet
@@ -2938,9 +2952,26 @@ class WechatRuntime {
         const { sessionId, text, completed, chunkType, frameShape } = readStreamFrame(payload);
         if (sessionId === undefined)
             return;
-        // v6：任何帧都刷新窗口，长工具回合也不会过期（窗口 5 分钟）。
-        const trackedNow = this.#wechatTurns.get(sessionId);
-        if (trackedNow !== undefined) trackedNow.at = Date.now();
+        // v8：用回合号判断来源——只有微信发起的新回合才推送回复/审批；桌面回合完全不推微信。
+        const rawTurn = payload && payload.frame ? payload.frame.turn : undefined;
+        const frameTurn = typeof rawTurn === 'number' ? rawTurn : undefined;
+        if (frameTurn !== undefined)
+            this.#activeTurn.set(sessionId, frameTurn);
+        const sourceTrack = this.#wechatTurns.get(sessionId);
+        let wechatOrigin = false;
+        if (sourceTrack !== undefined) {
+            if (sourceTrack.turn !== undefined) {
+                wechatOrigin = frameTurn === undefined || frameTurn === sourceTrack.turn;
+            }
+            else if (sourceTrack.pendingAt !== null && Date.now() - sourceTrack.pendingAt < 60 * 1000 &&
+                frameTurn !== undefined && frameTurn !== sourceTrack.prevTurn) {
+                // 提交后出现的新回合 = 微信发起的回合
+                sourceTrack.turn = frameTurn;
+                wechatOrigin = true;
+            }
+            if (wechatOrigin)
+                sourceTrack.at = Date.now();
+        }
         // Learn the stream's vocabulary. Each distinct value is logged once, so a long turn cannot
         // flood the log. This is how the tool-call signal gets identified from observation instead
         // of from a second guess about field names.
@@ -2966,16 +2997,9 @@ class WechatRuntime {
                 this.#recordOnce('#unboundStreams', `stream: no WeChat conversation is bound to ${sessionId} — its answer is not delivered`);
                 return;
             }
-            const originOnly = this.#settingsNow().originOnly !== false;
-            if (originOnly) {
-                const tracked = this.#wechatTurns.get(sessionId);
-                if (tracked === undefined || Date.now() - tracked.at > 5 * 60 * 1000) {
-                    this.#wechatTurns.delete(sessionId);
-                    this.#recordOnce('#desktopTurns', `stream: session ${sessionId} was not started from WeChat — its answer is not delivered`);
-                    return;
-                }
-                // v5：本通道回合内的所有帧都转发；标记用滑动窗口(5分钟)过期。
-                tracked.at = Date.now();
+            if (!wechatOrigin) {
+                this.#recordOnce('#desktopTurns', `stream: session ${sessionId} was desktop-originated — its answer is not delivered`);
+                return;
             }
             const existing = this.#replies.get(sessionId);
             if (existing !== undefined)
@@ -2991,6 +3015,7 @@ class WechatRuntime {
                 // The turn ended: send now, so the reply is not held behind the settle window.
                 this.#replies.set(sessionId, entry);
                 await this.#flushReply(sessionId);
+                this.#wechatTurns.delete(sessionId);
                 return;
             }
             // Read from the cache, never awaited: this handler must stay synchronous so two frames of
@@ -3749,9 +3774,6 @@ function readSettingsPatch(body) {
     }
     if (typeof body.requireConfirmation === 'boolean') {
         patch.requireConfirmation = body.requireConfirmation;
-    }
-    if (typeof body.originOnly === 'boolean') {
-        patch.originOnly = body.originOnly;
     }
     if (typeof body.presenceNote === 'string')
         patch.presenceNote = body.presenceNote;

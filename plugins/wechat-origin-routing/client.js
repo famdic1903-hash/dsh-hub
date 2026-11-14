@@ -200,8 +200,6 @@ window.__ModuleLoader__.load({
         quoteHistoryHint: '每个对话保留多少条已发消息，用来还原「引用」的内容。',
         presenceNote: '渠道身份提示',
         presenceNoteHint: '每条消息前都会附上，告诉 agent 你在手机上。不建议清空。',
-        originOnly: '只转发微信发起的回合',
-        originOnlyHint: '开启：微信发起才回微信、审批也在微信问，电脑发起的留在电脑；关闭：官方模式，全部推到微信。',
         settingsSave: '保存设置',
         settingsSaved: '已保存',
         settingsDirty: '有改动还没保存。',
@@ -319,8 +317,6 @@ window.__ModuleLoader__.load({
         quoteHistoryHint: 'How many sent messages to keep per conversation, so quotes resolve.',
         presenceNote: 'Channel note',
         presenceNoteHint: 'Prepended to every message, telling the agent you are on a phone.',
-        originOnly: 'Only route WeChat-initiated turns',
-        originOnlyHint: 'On: only turns you start from WeChat are delivered and asked in WeChat; desktop-initiated stays on desktop. Off: official mode, everything goes to WeChat.',
         settingsSave: 'Save',
         settingsSaved: 'Saved',
         settingsDirty: 'Changes are not saved yet.',
@@ -1335,23 +1331,6 @@ a.dsh-wechat-button { text-decoration: none; }
                   label: t.requireConfirmation,
                   disabled: state.busy,
                   onChange: (next) => edit('requireConfirmation', next),
-                }),
-              ),
-
-              h(
-                'div',
-                { className: 'dsh-wechat-row' },
-                h(
-                  'div',
-                  { className: 'dsh-wechat-row-text' },
-                  h('label', null, t.originOnly),
-                  h('span', { className: 'dsh-wechat-hint' }, t.originOnlyHint),
-                ),
-                h(Toggle, {
-                  checked: state.draft.originOnly !== false,
-                  label: t.originOnly,
-                  disabled: state.busy,
-                  onChange: (next) => edit('originOnly', next),
                 }),
               ),
 
