@@ -2625,14 +2625,10 @@ class WechatRuntime {
         const naming = await this.#isFirstMessage(decision.sessionId);
         // 渠道提示只保留标识，具体规范由 wechat-channel 技能负责。
         const presenceNote = settings.presenceNote === '' ? '' : '[渠道：微信]';
-        // v9：提交时若已有回合在跑，则把该回合标记为“微信参与”（插话也回微信）；否则等待下一个新回合。
-        const sessionNow = decision.sessionId;
-        const activeNow = this.#activeTurn.get(sessionNow);
-        this.#wechatTurns.set(sessionNow, {
+        // v10：记录“微信刚提交”的待定标记；下一个 step=1 的 start 帧若在 120 秒内出现，即判为微信回合。
+        // 若提交时已有回合在跑（插话），则当前回合的帧也直接按“有标记”处理。
+        this.#wechatTurns.set(decision.sessionId, {
             pendingAt: Date.now(),
-            prevTurn: activeNow,
-            turn: undefined,
-            steerTurn: activeNow,
             at: Date.now(),
         });
         /*
@@ -2941,10 +2937,7 @@ class WechatRuntime {
         const track = this.#wechatTurns.get(sessionId);
         if (track === undefined)
             return false;
-        const active = this.#activeTurn.get(sessionId);
-        if (active === undefined)
-            return false;
-        return track.turn === active || track.steerTurn === active;
+        return Date.now() - track.at < 10 * 60 * 1000;
     }
     /**
      * Feed one assistant stream frame into the reply buffer.
@@ -2958,38 +2951,28 @@ class WechatRuntime {
         const { sessionId, text, completed, chunkType, frameShape } = readStreamFrame(payload);
         if (sessionId === undefined)
             return;
-        // v9：回合来源判断——微信发起的回合、以及被微信插话的回合都推微信；纯桌面回合不推。
-        const rawTurn = payload && payload.frame ? payload.frame.turn : undefined;
-        const frameTurn = typeof rawTurn === 'number' ? rawTurn : undefined;
-        if (frameTurn !== undefined)
-            this.#activeTurn.set(sessionId, frameTurn);
-        const sourceTrack = this.#wechatTurns.get(sessionId);
+        // v10：用 step=1 的 start 帧识别“新的用户回合”：
+        // 微信提交后 120 秒内出现的新回合 = 微信发起；否则视为桌面回合并停止转发。
+        // 提交时回合已在跑（插话）不会出现新回合边界，按“有标记”直接转发。
+        const frame = payload && payload.frame ? payload.frame : undefined;
+        const isTurnStart = frame !== undefined && frame.type === 'start' && frame.step === 1;
+        let sourceTrack = this.#wechatTurns.get(sessionId);
         let wechatOrigin = false;
         if (sourceTrack !== undefined) {
-            if (frameTurn !== undefined) {
-                if (sourceTrack.steerTurn !== undefined && sourceTrack.steerTurn === frameTurn) {
-                    // 微信消息是在这个已在运行的回合里插话的
-                    wechatOrigin = true;
-                }
-                else if (sourceTrack.turn === frameTurn) {
-                    wechatOrigin = true;
-                }
-                else if (sourceTrack.turn === undefined && Date.now() - sourceTrack.pendingAt < 60 * 1000 &&
-                    frameTurn !== sourceTrack.prevTurn) {
-                    // 提交后出现的新回合 = 微信发起的回合
-                    sourceTrack.turn = frameTurn;
-                    wechatOrigin = true;
+            if (isTurnStart) {
+                if (Date.now() - sourceTrack.pendingAt < 120 * 1000) {
+                    sourceTrack.pendingAt = 0;
                 }
                 else {
-                    // 新的、非微信回合（桌面发起）——不再推送并清掉跟踪
                     this.#wechatTurns.delete(sessionId);
+                    this.#recordOnce('#desktopTurns', `stream: session ${sessionId} was desktop-originated — its answer is not delivered`);
                 }
             }
-            else if (sourceTrack.turn !== undefined || sourceTrack.steerTurn !== undefined) {
+            sourceTrack = this.#wechatTurns.get(sessionId);
+            if (sourceTrack !== undefined && Date.now() - sourceTrack.at < 10 * 60 * 1000) {
                 wechatOrigin = true;
-            }
-            if (wechatOrigin)
                 sourceTrack.at = Date.now();
+            }
         }
         // Learn the stream's vocabulary. Each distinct value is logged once, so a long turn cannot
         // flood the log. This is how the tool-call signal gets identified from observation instead
