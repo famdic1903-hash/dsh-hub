@@ -15,13 +15,13 @@
     "plugin",
     "remote-control"
   ],
-  "homepage": "https://github.com/xcisxc29/dsh-wechat#readme",
+  "homepage": "https://github.com/famdic1903-hash/dsh-hub",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xcisxc29/dsh-wechat.git"
+    "url": "git+https://github.com/famdic1903-hash/dsh-hub.git"
   },
   "bugs": {
-    "url": "https://github.com/xcisxc29/dsh-wechat/issues"
+    "url": "https://github.com/famdic1903-hash/dsh-hub/issues"
   },
   "main": "lib/host.js",
   "types": "lib/host.d.ts",
@@ -68,5 +68,6 @@
       "platform": "web",
       "immediately": true
     }
-  }
+  },
+  "author": "z77"
 }
