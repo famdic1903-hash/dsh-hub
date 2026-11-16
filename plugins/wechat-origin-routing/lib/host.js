@@ -8,7 +8,7 @@
  * @module dsh-wechat-plugin/host
  */
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -338,15 +338,35 @@ class WechatRuntime {
     #monitors = new Map();
     /** The running login handshake, if any. */
     #loginTask;
-    /** Buffered assistant text per session, plus the conversation it belongs to. */
+    /** turn 粒度来源状态：key = `${sessionId}#${turn}`。 */
+    #turns = new Map();
+    /** attemptId -> { sessionId, turn, step }（由 start 帧建立）。 */
+    #attempts = new Map();
+    /** `${sessionId}#${callId}` -> { turn, step }（由 tool-call-delta / tool-call 建立）。 */
+    #calls = new Map();
+    /** turnKey -> { conversationId, text, timer, flushing, dirty }。 */
     #replies = new Map();
-    /**
-     * 当前回合由微信消息发起的会话（sessionId -> 发起时间）。
-     * 桌面端与微信共用一个会话，但只有微信发起的回合，回复才转发到手机。
-     */
-    #wechatTurns = new Map();
-    /** 每个会话当前 assistant stream 的回合号（v8 来源判断用）。 */
-    #activeTurn = new Map();
+    /** turnKey -> 已到达但尚未 finalize 的原始文本（同步累加，保证顺序）。 */
+    #pendingText = new Map();
+    /** turnKey -> 正在执行的 finalize Promise（shutdown 需要跟踪）。 */
+    #finalizing = new Map();
+    /** 已排期但尚未执行的 finalize 定时器。 */
+    #finalizeScheduled = new Set();
+    /** 落盘失败的文本暂存在内存，维护任务会重试。 */
+    #emergencyHold = new Map();
+    /** attemptKey -> {sessionId,turn,at}：attempt 删除后短期保留，供迟到 chunk 找回 turn。 */
+    #attemptTombstones = new Map();
+    /** 无法归属 turn 的迟到文本，维护任务会落盘。 */
+    #orphanText = new Map();
+    /** turnKey -> { conversationId, text, attempts, timer }：发送失败待重试。 */
+    #outbox = new Map();
+    /** 审批状态：key = `${sessionId}#${callId}` 或 `${sessionId}#noCall#${seq}`。 */
+    #approvals = new Map();
+    #approvalSeq = 0;
+    /** requestId -> sessionId（claim 事件缺 agent 时的兜底）。 */
+    #rpcSessions = new Map();
+    /** turn 兜底清理定时器。 */
+    #purgeTimer = undefined;
     /** Recent errors, surfaced in the settings page. */
     #errors = [];
     /** Non-text messages awaiting an instruction, keyed by conversation. */
@@ -1547,6 +1567,23 @@ class WechatRuntime {
      * @param signal - Aborts when the harness withdraws the request.
      * @returns The parsed answer, or undefined when the request was withdrawn first.
      */
+    /** 在统一截止时间前等待；超时 abort 并返回 undefined。 */
+    async #withinDeadline(promise, controller, deadline) {
+        const remaining = Math.max(0, deadline - Date.now());
+        let timer;
+        const timeout = new Promise((resolve) => {
+            timer = setTimeout(() => resolve(undefined), remaining);
+            timer.unref?.();
+        });
+        try {
+            return await Promise.race([promise, timeout]);
+        }
+        finally {
+            clearTimeout(timer);
+            if (Date.now() >= deadline && !controller.signal.aborted)
+                controller.abort();
+        }
+    }
     async #ask(conversationId, account, peerId, body, kind, parse, signal) {
         const settled = Promise.withResolvers();
         // A later prompt in the same conversation replaces this one: the user is looking at the most
@@ -1593,27 +1630,72 @@ class WechatRuntime {
     approvalListener() {
         return async (request, next) => {
             const record = (request ?? {});
+            const deadline = Date.now() + 5 * 60 * 1000;
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+            timer.unref?.();
+            const onAbort = () => controller.abort();
+            if (record.signal?.aborted === true)
+                controller.abort();
+            else
+                record.signal?.addEventListener?.('abort', onAbort, { once: true });
             const sessionId = sessionIdOf(record.agent);
-            const conversationId = await this.#conversationForAgentSession(sessionId);
-            // Recorded either way. An answerer that is never invoked and one that abstains look
-            // identical from the phone — both leave the prompt on the desktop — so the decision is
-            // written where the next diagnosis can find it.
-            this.#recordBoot(`approval seen: tool=${String(record.toolName)} session=${sessionId ?? '(none)'} ` +
-                `${conversationId === undefined ? 'not-a-wechat-session -> delegate' : 'claiming'}`);
-            if (conversationId === undefined)
-                return await next();
-            if (sessionId === undefined || !this.#isWechatOriginTurn(sessionId)) {
-                // 电脑端发起的回合：授权/提问交回电脑弹窗，不送到微信。
-                this.#recordBoot(`delegated to desktop: session ${String(sessionId)} was not started from WeChat`);
+            let conversationId;
+            try {
+                conversationId = await this.#withinDeadline(this.#conversationForAgentSession(sessionId), controller, deadline);
+            }
+            catch (error) {
+                this.#recordError(`approval conversation lookup failed: ${String(error)}`);
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
                 return await next();
             }
-            const target = await this.#askTarget(conversationId);
-            if (target === undefined)
+            this.#recordBoot(`approval seen: tool=${String(record.toolName)} session=${sessionId ?? '(none)'} ` +
+                `${conversationId === undefined ? 'not-a-wechat-session -> delegate' : 'claiming'}`);
+            if (conversationId === undefined) {
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
                 return await next();
-            const answer = await this.#ask(conversationId, target.account, target.peerId, presentApproval(record).body, 'approval', parseApprovalReply, record.signal);
-            // Withdrawn or unanswerable: hand it back rather than guessing. Guessing on a permission
-            // prompt means granting something the user never agreed to.
-            if (answer === undefined)
+            }
+            const callId = typeof record.callId === 'string' ? record.callId : undefined;
+            const turnState = sessionId === undefined ? undefined : this.#approvalTurn(sessionId, callId);
+            if (!this.#approvalIsWechat(turnState)) {
+                this.#recordBoot(`delegated to desktop: session ${String(sessionId)} tool=${String(record.toolName)} ` +
+                    `turn=${turnState === undefined ? '(none)' : String(turnState.turn)} channels=${turnState === undefined ? 'unknown' : [...turnState.channels].join(',')}`);
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
+                return await next();
+            }
+            const approvalKey = `${String(sessionId)}#${callId ?? ('noCall#' + String(++this.#approvalSeq))}`;
+            const existing = this.#approvals.get(approvalKey);
+            if (existing !== undefined) {
+                this.#recordBoot(`duplicate approval ignored: ${approvalKey} status=${String(existing.status)}`);
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
+                return await next();
+            }
+            const approval = { key: approvalKey, sessionId, callId, turn: turnState.turn, status: 'pending', createdAt: Date.now() };
+            this.#approvals.set(approvalKey, approval);
+            turnState.pendingApprovals += 1;
+            turnState.status = 'awaiting-approval';
+            let answer;
+            try {
+                const target = await this.#withinDeadline(this.#askTarget(conversationId), controller, deadline);
+                if (target !== undefined) {
+                    answer = await this.#withinDeadline(this.#ask(conversationId, target.account, target.peerId, presentApproval(record).body, 'approval', parseApprovalReply, controller.signal), controller, deadline);
+                }
+            }
+            catch (error) {
+                this.#recordError(`approval ask failed: ${String(error)}`);
+                answer = undefined;
+            }
+            finally {
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
+            }
+            const outcome = answer === undefined ? (controller.signal.aborted ? 'timeout' : 'cancelled') : 'answered';
+            const settled = this.#settleApproval(approval, outcome);
+            if (!settled || answer === undefined)
                 return await next();
             return answer;
         };
@@ -1629,22 +1711,63 @@ class WechatRuntime {
             const questions = record.questions;
             if (!Array.isArray(questions) || questions.length === 0)
                 return await next();
+            const deadline = Date.now() + 5 * 60 * 1000;
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+            timer.unref?.();
+            const onAbort = () => controller.abort();
+            if (record.signal?.aborted === true)
+                controller.abort();
+            else
+                record.signal?.addEventListener?.('abort', onAbort, { once: true });
             const sessionId = sessionIdOf(record.agent);
-            const conversationId = await this.#conversationForAgentSession(sessionId);
-            this.#recordBoot(`question seen: count=${String(questions.length)} session=${sessionId ?? '(none)'} ` +
-                `${conversationId === undefined ? 'not-a-wechat-session -> delegate' : 'claiming'}`);
-            if (conversationId === undefined)
-                return await next();
-            if (sessionId === undefined || !this.#isWechatOriginTurn(sessionId)) {
-                // 电脑端发起的回合：授权/提问交回电脑弹窗，不送到微信。
-                this.#recordBoot(`delegated to desktop: session ${String(sessionId)} was not started from WeChat`);
+            let conversationId;
+            try {
+                conversationId = await this.#withinDeadline(this.#conversationForAgentSession(sessionId), controller, deadline);
+            }
+            catch (error) {
+                this.#recordError(`question conversation lookup failed: ${String(error)}`);
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
                 return await next();
             }
-            const target = await this.#askTarget(conversationId);
-            if (target === undefined)
+            this.#recordBoot(`question seen: count=${String(questions.length)} session=${sessionId ?? '(none)'} ` +
+                `${conversationId === undefined ? 'not-a-wechat-session -> delegate' : 'claiming'}`);
+            if (conversationId === undefined) {
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
                 return await next();
-            const answer = await this.#ask(conversationId, target.account, target.peerId, presentQuestions(questions).body, 'question', (reply) => parseQuestionReply(questions, reply), record.signal);
-            if (answer === undefined)
+            }
+            const turnState = sessionId === undefined ? undefined : this.#approvalTurn(sessionId, undefined);
+            if (!this.#approvalIsWechat(turnState)) {
+                this.#recordBoot(`delegated to desktop: question session ${String(sessionId)} turn=${turnState === undefined ? '(none)' : String(turnState.turn)}`);
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
+                return await next();
+            }
+            const questionKey = `${String(sessionId)}#question#${String(++this.#approvalSeq)}`;
+            const approval = { key: questionKey, sessionId, turn: turnState.turn, status: 'pending', createdAt: Date.now() };
+            this.#approvals.set(questionKey, approval);
+            turnState.pendingApprovals += 1;
+            turnState.status = 'awaiting-approval';
+            let answer;
+            try {
+                const target = await this.#withinDeadline(this.#askTarget(conversationId), controller, deadline);
+                if (target !== undefined) {
+                    answer = await this.#withinDeadline(this.#ask(conversationId, target.account, target.peerId, presentQuestions(questions).body, 'question', (reply) => parseQuestionReply(questions, reply), controller.signal), controller, deadline);
+                }
+            }
+            catch (error) {
+                this.#recordError(`question ask failed: ${String(error)}`);
+                answer = undefined;
+            }
+            finally {
+                clearTimeout(timer);
+                record.signal?.removeEventListener?.('abort', onAbort);
+            }
+            const outcome = answer === undefined ? (controller.signal.aborted ? 'timeout' : 'cancelled') : 'answered';
+            const settled = this.#settleApproval(approval, outcome);
+            if (!settled || answer === undefined)
                 return await next();
             return answer;
         };
@@ -2625,12 +2748,6 @@ class WechatRuntime {
         const naming = await this.#isFirstMessage(decision.sessionId);
         // 渠道提示只保留标识，具体规范由 wechat-channel 技能负责。
         const presenceNote = settings.presenceNote === '' ? '' : '[渠道：微信]';
-        // v10：记录“微信刚提交”的待定标记；下一个 step=1 的 start 帧若在 120 秒内出现，即判为微信回合。
-        // 若提交时已有回合在跑（插话），则当前回合的帧也直接按“有标记”处理。
-        this.#wechatTurns.set(decision.sessionId, {
-            pendingAt: Date.now(),
-            at: Date.now(),
-        });
         /*
          * Say so before anything else when the conversation had to be moved.
          *
@@ -2667,9 +2784,9 @@ class WechatRuntime {
             : [prompt].filter((text) => text !== '');
         let delivered = false;
         for (const text of outbound) {
-            // A refused steer is a real outcome — the turn it targeted can end first — so the queue is
-            // tried instead of losing the message.
-            if (await this.#submit(decision.sessionId, text, 'steer'))
+            // 只有恰好一个同渠道（微信）非终结 turn 才 steer，否则 queue；
+            // steer 被拒绝时 #submit 内部会再退到 queue。
+            if (await this.#submit(decision.sessionId, text, this.#chooseMode(decision.sessionId)))
                 delivered = true;
             else if (await this.#submit(decision.sessionId, text, 'queue'))
                 delivered = true;
@@ -2702,22 +2819,28 @@ class WechatRuntime {
             // prompt, which is what `hasPromptContent` requires.
             content: [{ type: 'text', text: prompt }],
         };
+        const requestId = `wechat-${randomUUID()}`;
+        this.#rpcSessions.set(requestId, { sessionId, at: Date.now() });
         try {
-            await this.#ctx.sessionController.prompt({ ...request, requestId: `wechat-${randomUUID()}`, sessionId, mode }, new AbortController().signal);
+            await this.#ctx.sessionController.prompt({ ...request, requestId, sessionId, mode }, new AbortController().signal);
             return true;
         }
         catch (error) {
+            this.#rpcSessions.delete(requestId);
             if (mode !== 'steer') {
                 this.#recordError(`提交任务失败: ${error instanceof Error ? error.message : String(error)}`);
                 return false;
             }
             this.#recordBoot(`steer refused, falling back to queue: ${error instanceof Error ? error.message : String(error)}`);
         }
+        const queueRequestId = `wechat-${randomUUID()}`;
+        this.#rpcSessions.set(queueRequestId, { sessionId, at: Date.now() });
         try {
-            await this.#ctx.sessionController.prompt({ ...request, requestId: `wechat-${randomUUID()}`, sessionId, mode: 'queue' }, new AbortController().signal);
+            await this.#ctx.sessionController.prompt({ ...request, requestId: queueRequestId, sessionId, mode: 'queue' }, new AbortController().signal);
             return true;
         }
         catch (error) {
+            this.#rpcSessions.delete(queueRequestId);
             this.#recordError(`排队提交也失败: ${error instanceof Error ? error.message : String(error)}`);
             return false;
         }
@@ -2853,43 +2976,56 @@ class WechatRuntime {
             text,
             ...(contextToken === undefined ? {} : { contextToken }),
         });
-        // The id the service assigned plus a body preview, recorded so a quote of this message can
-        // be resolved and the resolution verified later. Without the preview there is no way to
-        // tell a correct lookup from a wrong one.
+        // #send 抛错 = 服务端拒绝；正常返回 = 发送已被接受（message_id 可能缺失）。
+        // 先锁定“已接受”结果；后续任何日志/记账失败都不得改变它。
+        const accepted = true;
         const id = sent?.serverMessageId;
         const preview = text.replace(/\s+/g, ' ').slice(0, 120);
-        this.#recordBoot(`outbound text id=${typeof id === 'string' ? id : '(none)'} len=${String(text.length)}` +
+        // 日志不是发送的一部分：日志抛错不得把已接受的发送判为失败。
+        const logBoot = (message) => {
+            try {
+                this.#recordBoot(message);
+            }
+            catch {
+                // 日志失败忽略
+            }
+        };
+        const logError = (message) => {
+            try {
+                this.#recordError(message);
+            }
+            catch {
+                // 日志失败忽略
+            }
+        };
+        logBoot(`outbound text id=${typeof id === 'string' ? id : '(none)'} len=${String(text.length)}` +
             ` body=${preview}`);
         /*
-         * Charged here, after the send, and only on the path that actually sent.
-         *
-         * This is the one place a text reply is charged, and it matters that it comes after `#send`:
-         * a refused send throws first, so the closed window's queue never counts slots the service did
-         * not accept. That is what keeps the stored count equal to the number of messages the user
-         * actually received — the number that decides whether the ask for a new window comes in time.
+         * 发送已被接受之后的本地记账（配额、引用历史、列表编号）不是发送的一部分：
+         * 它们失败只能记录错误，不能把已接受的发送重新判为失败，否则会触发重复发送。
          */
-        await this.#noteQuota(account, conversationId, peerId, contextToken);
+        try {
+            await this.#noteQuota(account, conversationId, peerId, contextToken);
+        }
+        catch (error) {
+            logError(`quota note failed after accepted send: ${String(error)}`);
+        }
         if (typeof id === 'string') {
-            // Retained so a quote of this message can be turned back into content. A quote carries
-            // only an id, so without this the agent sees "elaborate on this" and nothing else.
-            const settings = await this.#settings();
-            await this.#store.update((s) => {
-                rememberSentMessage(s, account.accountId, conversationId, { messageId: id, kind: 'text', preview, at: Date.now() }, settings.quoteHistory);
-            });
-            /*
-             * And, when this message *was* a listing, the numbering it printed is frozen under the same id.
-             *
-             * It has to be here rather than where the listing was built: the id is assigned by the service
-             * when the send succeeds, and that id is the only thing a quote of the message will carry. A
-             * listing that could not be sent has no numbering worth remembering.
-             */
-            if (numbered !== undefined) {
-                await this.#rememberListedRows(account.accountId, conversationId, id, numbered);
+            try {
+                const settings = await this.#settings();
+                await this.#store.update((s) => {
+                    rememberSentMessage(s, account.accountId, conversationId, { messageId: id, kind: 'text', preview, at: Date.now() }, settings.quoteHistory);
+                });
+                if (numbered !== undefined) {
+                    await this.#rememberListedRows(account.accountId, conversationId, id, numbered);
+                }
+            }
+            catch (error) {
+                logError(`quote/bookkeeping failed after accepted send: ${String(error)}`);
             }
         }
-        // Reported so a caller with a browsing position knows whether the screen arrived. A service that
-        // answered without a message id did not deliver it, which is the same failure §3.6 records.
-        return typeof id === 'string';
+        // 发送被接受即成功；message_id 只影响引用/历史，不影响成败。
+        return accepted;
     }
     /**
      * Resolve the WeChat conversation bound to a session.
@@ -2929,15 +3065,271 @@ class WechatRuntime {
         this.#seenShapes.set(bucket, seen);
         this.#recordBoot(line);
     }
+    #turnKey(sessionId, turn) {
+        return `${String(sessionId)}#${String(turn)}`;
+    }
+    /** 取/建一个 turn 状态。 */
+    #ensureTurn(sessionId, turn) {
+        const key = this.#turnKey(sessionId, turn);
+        let state = this.#turns.get(key);
+        if (state === undefined) {
+            state = {
+                sessionId, turn,
+                channels: new Set(),
+                lastChannel: 'desktop',
+                status: 'running',
+                createdAt: Date.now(),
+                lastActivityAt: Date.now(),
+                activeAttempts: new Set(),
+                pendingApprovals: 0,
+                endedAt: undefined,
+                finalizedAt: undefined,
+            };
+            this.#turns.set(key, state);
+        }
+        return state;
+    }
     /**
-     * v8：当前会话是否正在跑一个“微信发起的回合”。
-     * 审批/选择题用它在微信与桌面之间分流。
+     * 只有恰好一个非终结 turn，且该 turn 是纯微信来源时才允许 steer。
+     * 存在其它活动 turn、混合来源或来源不明 → 一律 queue。
      */
-    #isWechatOriginTurn(sessionId) {
-        const track = this.#wechatTurns.get(sessionId);
-        if (track === undefined)
+    #chooseMode(sessionId) {
+        let candidate;
+        for (const state of this.#turns.values()) {
+            if (state.sessionId !== sessionId)
+                continue;
+            if (state.status !== 'running' && state.status !== 'awaiting-approval')
+                continue;
+            if (candidate !== undefined)
+                return 'queue';
+            candidate = state;
+        }
+        if (candidate === undefined)
+            return 'queue';
+        if (!(candidate.channels.size === 1 && candidate.channels.has('wechat')))
+            return 'queue';
+        return 'steer';
+    }
+    /**
+     * 审批/提问的归属 turn：
+     * 1) callId 能映射到 tool-call-delta → 精确命中；
+     * 2) 否则仅当该会话恰好一个非终结 turn 时兜底；
+     * 3) 其余返回 undefined（交桌面）。
+     */
+    #approvalTurn(sessionId, callId) {
+        if (callId !== undefined) {
+            const linked = this.#calls.get(`${String(sessionId)}#${String(callId)}`);
+            if (linked !== undefined)
+                return this.#turns.get(this.#turnKey(sessionId, linked.turn));
+        }
+        let unique;
+        for (const state of this.#turns.values()) {
+            if (state.sessionId !== sessionId)
+                continue;
+            if (state.status !== 'running' && state.status !== 'awaiting-approval')
+                continue;
+            if (unique !== undefined)
+                return undefined;
+            unique = state;
+        }
+        return unique;
+    }
+    /** 审批是否在微信进行：只有纯微信回合才允许；混合/桌面一律桌面兜底。 */
+    #approvalIsWechat(state) {
+        return state !== undefined && state.channels.size === 1 && state.channels.has('wechat');
+    }
+    /** settle-once；返回是否真正完成了本次结算。终态记录保留一段时间。 */
+    #settleApproval(approval, outcome) {
+        if (approval === undefined || approval.status !== 'pending')
             return false;
-        return Date.now() - track.at < 10 * 60 * 1000;
+        approval.status = outcome;
+        approval.answeredAt = Date.now();
+        const state = this.#turns.get(this.#turnKey(approval.sessionId, approval.turn));
+        if (state !== undefined) {
+            state.pendingApprovals = Math.max(0, state.pendingApprovals - 1);
+            if (state.pendingApprovals === 0 && state.status === 'awaiting-approval')
+                state.status = 'running';
+        }
+        if (state !== undefined)
+            this.#maybePurgeTurn(this.#turnKey(state.sessionId, state.turn));
+        return true;
+    }
+    /**
+     * 清理条件：turn 已 ending、endedAt 存在、activeAttempts 为空、finalize 已完成，
+     * 且超过 1 秒宽限（给迟到帧留窗口）；审批/reply/outbox/pending 均清空。
+     */
+    #maybePurgeTurn(key) {
+        const state = this.#turns.get(key);
+        if (state === undefined)
+            return;
+        if (state.status !== 'ending' || state.pendingApprovals > 0)
+            return;
+        if (state.endedAt === undefined || state.activeAttempts.size > 0)
+            return;
+        if (state.finalizedAt === undefined || Date.now() - state.finalizedAt < 1000)
+            return;
+        if (this.#pendingText.has(key) || this.#replies.has(key) || this.#outbox.has(key) || this.#finalizing.has(key))
+            return;
+        this.#turns.delete(key);
+        for (const [attemptKey, a] of [...this.#attempts]) {
+            if (a.sessionId === state.sessionId && a.turn === state.turn) {
+                this.#rememberAttempt(attemptKey, a.sessionId, a.turn);
+                this.#attempts.delete(attemptKey);
+            }
+        }
+        for (const [callKey, c] of [...this.#calls]) {
+            if (c.sessionId === state.sessionId && c.turn === state.turn)
+                this.#calls.delete(callKey);
+        }
+    }
+    #schedulePurge(key) {
+        if (this.#disposed)
+            return;
+        const timer = setTimeout(() => {
+            this.#maybePurgeTurn(key);
+        }, 1100);
+        timer.unref?.();
+    }
+    /** session/event 订阅：维护 turn 生命周期与 tool-call 映射。 */
+    onSessionEvent(session, event) {
+        try {
+            const sessionId = session?.header?.id ?? session?.id;
+            if (sessionId === undefined || event?.type === undefined)
+                return;
+            const data = event.data ?? {};
+            switch (event.type) {
+                case 'turn/start':
+                    this.#ensureTurn(sessionId, data.turn);
+                    break;
+                case 'step/start': {
+                    const state = this.#ensureTurn(sessionId, data.turn);
+                    state.lastActivityAt = Date.now();
+                    break;
+                }
+                case 'tool/call':
+                    if (typeof data.callId === 'string' && typeof data.turn === 'number') {
+                        this.#calls.set(`${sessionId}#${data.callId}`, { sessionId, turn: data.turn, step: data.step });
+                    }
+                    break;
+                case 'turn/end': {
+                    const key = this.#turnKey(sessionId, data.turn);
+                    const state = this.#turns.get(key);
+                    if (state !== undefined) {
+                        state.status = 'ending';
+                        state.endedAt = Date.now();
+                        state.lastActivityAt = Date.now();
+                        if (state.activeAttempts.size === 0)
+                            this.#scheduleFinalize(sessionId, data.turn);
+                    }
+                    break;
+                }
+                default:
+                    break;
+            }
+        }
+        catch (error) {
+            this.#recordError(`session event failed: ${String(error)}`);
+        }
+    }
+    /** agent/inbox/claimed：把 rpcId 解析为来源渠道并绑定到 turn。 */
+    onInboxClaimed(payload) {
+        try {
+            const message = payload?.message;
+            const turn = payload?.turn;
+            const rpcId = typeof message?.source?.rpcId === 'string' ? message.source.rpcId : '';
+            const rpcRecord = this.#rpcSessions.get(rpcId);
+            const sessionId = payload?.agent?.session?.id ?? rpcRecord?.sessionId;
+            if (sessionId === undefined || typeof turn !== 'number')
+                return;
+            const channel = rpcId.startsWith('wechat-') ? 'wechat' : 'desktop';
+            const state = this.#ensureTurn(sessionId, turn);
+            state.channels.add(channel);
+            state.lastChannel = channel;
+            state.lastActivityAt = Date.now();
+            this.#rpcSessions.delete(rpcId);
+            if (state.channels.size > 1) {
+                this.#recordBoot(`mixed turn: session=${sessionId} turn=${String(turn)} channels=${[...state.channels].join(',')}`);
+            }
+        }
+        catch (error) {
+            this.#recordError(`inbox claim failed: ${String(error)}`);
+        }
+    }
+    /** 兜底清理：30 分钟无活动的非审批 turn 强制收尾。 */
+    startMaintenance() {
+        if (this.#purgeTimer !== undefined)
+            return;
+        this.#purgeTimer = setInterval(() => {
+            const now = Date.now();
+            this.#retryEmergencyHold();
+            this.#retryOrphanText();
+            // attempt tombstone TTL：10 分钟
+            for (const [attemptKey, record] of [...this.#attemptTombstones]) {
+                if (now - record.at > 10 * 60 * 1000)
+                    this.#attemptTombstones.delete(attemptKey);
+            }
+            for (const key of [...this.#turns.keys()]) {
+                const state = this.#turns.get(key);
+                if (state === undefined || state.pendingApprovals > 0)
+                    continue;
+                if (now - state.lastActivityAt <= 30 * 60 * 1000)
+                    continue;
+                if (state.status !== 'ending') {
+                    // 运行中的 turn 不能凭 inactivity 判定结束：可能是长工具、长模型调用或桌面审批。
+                    // 不结束、不清理 attempts、不提前发送/删除 pendingText，只更新检查时间避免刷日志。
+                    this.#recordOnce(`#inactivity:${key}`, `inactivity while turn still running: ${key}`);
+                    state.lastActivityAt = now;
+                    continue;
+                }
+                // 超时收尾：必须设置 endedAt，并走 finalize（不能只 flushReply）。
+                state.status = 'ending';
+                state.endedAt = Date.now();
+                if (state.activeAttempts.size === 0) {
+                    this.#scheduleFinalize(state.sessionId, state.turn);
+                }
+                else {
+                    // 明确超时策略：清理未观测 attempt，再强制 finalize。
+                    this.#recordError(`timeout finalize: clearing ${String(state.activeAttempts.size)} attempts at ${key}`);
+                    for (const attemptKey of [...state.activeAttempts]) {
+                        state.activeAttempts.delete(attemptKey);
+                        this.#rememberAttempt(attemptKey, state.sessionId, state.turn);
+                        this.#attempts.delete(attemptKey);
+                    }
+                    this.#scheduleFinalize(state.sessionId, state.turn, true);
+                }
+            }
+            // 长期没有 end 的 attempt
+            for (const [attemptKey, attempt] of [...this.#attempts]) {
+                if (now - (attempt.at ?? 0) <= 60 * 60 * 1000)
+                    continue;
+                const state = this.#turns.get(this.#turnKey(attempt.sessionId, attempt.turn));
+                if (state !== undefined) {
+                    state.activeAttempts.delete(attemptKey);
+                    this.#rememberAttempt(attemptKey, attempt.sessionId, attempt.turn);
+                }
+                this.#attempts.delete(attemptKey);
+                this.#recordError(`stale attempt dropped: ${attemptKey}`);
+                // attempt 清理后若 turn 已 ending 且 attempts 归零，必须安排 finalize。
+                if (state !== undefined && state.status === 'ending' && state.activeAttempts.size === 0)
+                    this.#scheduleFinalize(attempt.sessionId, attempt.turn);
+            }
+            // 未收到 claim 的 requestId
+            for (const [rpcId, record] of [...this.#rpcSessions]) {
+                if (now - (record?.at ?? 0) > 10 * 60 * 1000)
+                    this.#rpcSessions.delete(rpcId);
+            }
+            // 审批：pending 超时；终态保留 10 分钟后清理
+            for (const [key, approval] of [...this.#approvals]) {
+                if (approval.status === 'pending') {
+                    if (now - approval.createdAt > 2 * 60 * 60 * 1000)
+                        this.#settleApproval(approval, 'timeout');
+                    continue;
+                }
+                if (now - (approval.answeredAt ?? approval.createdAt) > 10 * 60 * 1000)
+                    this.#approvals.delete(key);
+            }
+        }, 5 * 60 * 1000);
+        this.#purgeTimer.unref?.();
     }
     /**
      * Feed one assistant stream frame into the reply buffer.
@@ -2947,128 +3339,500 @@ class WechatRuntime {
      * fragments, which is what a chat transcript needs. A frame that ends the turn
      * flushes immediately rather than waiting out the window.
      */
+    #rememberAttempt(attemptKey, sessionId, turn) {
+        this.#attemptTombstones.set(attemptKey, { sessionId, turn, at: Date.now() });
+        if (this.#attemptTombstones.size > 500) {
+            let oldestKey;
+            let oldestAt = Infinity;
+            for (const [key, record] of this.#attemptTombstones) {
+                if (record.at < oldestAt) {
+                    oldestAt = record.at;
+                    oldestKey = key;
+                }
+            }
+            if (oldestKey !== undefined)
+                this.#attemptTombstones.delete(oldestKey);
+        }
+    }
+    #holdOrphanText(key, text) {
+        if (text === '')
+            return;
+        this.#orphanText.set(key, (this.#orphanText.get(key) ?? '') + text);
+    }
+    #retryOrphanText() {
+        for (const [key, text] of [...this.#orphanText]) {
+            // 只有确认本批次成功落盘才删除；失败保留原文本。
+            const ok = this.#persistFailedReply(key, text, 'orphan text (no attempt/turn mapping)', false);
+            if (ok && this.#orphanText.get(key) === text)
+                this.#orphanText.delete(key);
+        }
+    }
     onAssistantFrame(payload) {
         const { sessionId, text, completed, chunkType, frameShape } = readStreamFrame(payload);
         if (sessionId === undefined)
             return;
-        // v10：用 step=1 的 start 帧识别“新的用户回合”：
-        // 微信提交后 120 秒内出现的新回合 = 微信发起；否则视为桌面回合并停止转发。
-        // 提交时回合已在跑（插话）不会出现新回合边界，按“有标记”直接转发。
-        const frame = payload && payload.frame ? payload.frame : undefined;
-        const isTurnStart = frame !== undefined && frame.type === 'start' && frame.step === 1;
-        let sourceTrack = this.#wechatTurns.get(sessionId);
-        let wechatOrigin = false;
-        if (sourceTrack !== undefined) {
-            if (isTurnStart) {
-                if (Date.now() - sourceTrack.pendingAt < 120 * 1000) {
-                    sourceTrack.pendingAt = 0;
-                }
-                else {
-                    this.#wechatTurns.delete(sessionId);
-                    this.#recordOnce('#desktopTurns', `stream: session ${sessionId} was desktop-originated — its answer is not delivered`);
-                }
+        const frame = payload?.frame;
+        const attemptId = typeof frame?.attemptId === 'string' ? frame.attemptId : undefined;
+        const attemptKey = attemptId === undefined ? undefined : `${sessionId}#${attemptId}`;
+        let turn;
+        if (frame?.type === 'start' && typeof frame.turn === 'number') {
+            turn = frame.turn;
+        }
+        else if (attemptKey !== undefined) {
+            const active = this.#attempts.get(attemptKey);
+            const tombstone = active === undefined ? this.#attemptTombstones.get(attemptKey) : undefined;
+            turn = active?.turn ?? tombstone?.turn;
+        }
+        if (turn === undefined) {
+            // attemptId 缺失或映射已过期：不静默丢文本，进 orphan 队列由维护任务落盘。
+            if (text !== undefined && text !== '')
+                this.#holdOrphanText(`${sessionId}#noattempt`, text);
+            this.#recordOnce('#orphanFrames', `stream frame without turn: session=${sessionId} type=${String(frame?.type)} attempt=${String(attemptId)}`);
+            return;
+        }
+        const turnKey = this.#turnKey(sessionId, turn);
+        let state = this.#turns.get(turnKey);
+        if (state === undefined) {
+            if (frame?.type === 'start' && attemptKey !== undefined) {
+                state = this.#ensureTurn(sessionId, turn);
+                this.#attempts.set(attemptKey, { sessionId, turn, step: frame.step, at: Date.now() });
+                state.activeAttempts.add(attemptKey);
             }
-            sourceTrack = this.#wechatTurns.get(sessionId);
-            if (sourceTrack !== undefined && Date.now() - sourceTrack.at < 10 * 60 * 1000) {
-                wechatOrigin = true;
-                sourceTrack.at = Date.now();
+            else {
+                // turn 已被 purge：迟到文本落盘，不丢、不误判来源。
+                if (text !== undefined && text !== '')
+                    this.#holdLateText(turnKey, text);
+                return;
             }
         }
-        // Learn the stream's vocabulary. Each distinct value is logged once, so a long turn cannot
-        // flood the log. This is how the tool-call signal gets identified from observation instead
-        // of from a second guess about field names.
+        if (frame?.type === 'start' && attemptKey !== undefined) {
+            this.#attempts.set(attemptKey, { sessionId, turn, step: frame.step, at: Date.now() });
+            state.activeAttempts.add(attemptKey);
+        }
+        if (frame?.type === 'chunk' && frame.chunk?.type === 'tool-call-delta' &&
+            typeof frame.chunk.id === 'string' && attemptKey !== undefined) {
+            const a = this.#attempts.get(attemptKey);
+            if (a !== undefined)
+                this.#calls.set(`${sessionId}#${frame.chunk.id}`, { sessionId, turn: a.turn, step: a.step });
+        }
+        if (frame?.type === 'end') {
+            if (attemptKey !== undefined) {
+                this.#attempts.delete(attemptKey);
+                state.activeAttempts.delete(attemptKey);
+                // 正常结束也保留 tombstone，承接 end 之后可能到达的 chunk。
+                this.#rememberAttempt(attemptKey, sessionId, turn);
+            }
+            state.lastActivityAt = Date.now();
+            if (state.status === 'ending' && state.endedAt !== undefined && state.activeAttempts.size === 0)
+                this.#scheduleFinalize(sessionId, turn);
+        }
         if (chunkType !== undefined)
             this.#recordOnce('#chunkTypes', `stream chunk kind: ${chunkType}`);
         if (frameShape !== undefined)
             this.#recordOnce('#frameShapes', `stream frame shape: ${frameShape}`);
-        if ((text === undefined || text === '') && completed !== true)
+        if (text === undefined || text === '')
             return;
-        void (async () => {
-            const bindings = (await this.#store.read()).bindings;
-            const conversation = Object.values(bindings).find((entry) => entry.sessionId === sessionId);
-            if (conversation === undefined) {
-                /*
-                 * A session no conversation is bound to produces nothing the phone can receive.
-                 *
-                 * That is normal for a turn the user started on the desktop — which is why this is a boot-log
-                 * observation rather than an error, and why it is written once per session — but it is also
-                 * what a binding that went away looks like, and then the answer is genuinely lost. Logged
-                 * because "the model finished and no message arrived" has otherwise no line anywhere: the
-                 * stream reader saw the text and this early return threw it away without a word.
-                 */
-                this.#recordOnce('#unboundStreams', `stream: no WeChat conversation is bound to ${sessionId} — its answer is not delivered`);
-                return;
-            }
-            if (!wechatOrigin) {
-                this.#recordOnce('#desktopTurns', `stream: session ${sessionId} was desktop-originated — its answer is not delivered`);
-                return;
-            }
-            const existing = this.#replies.get(sessionId);
-            if (existing !== undefined)
-                clearTimeout(existing.timer);
-            const entry = existing ?? {
-                text: '',
-                conversationId: conversation.conversationId,
-                timer: undefined,
-            };
-            if (text !== undefined)
-                entry.text += text;
-            if (completed === true) {
-                // The turn ended: send now, so the reply is not held behind the settle window.
-                this.#replies.set(sessionId, entry);
-                await this.#flushReply(sessionId);
-                this.#wechatTurns.delete(sessionId);
-                return;
-            }
-            // Read from the cache, never awaited: this handler must stay synchronous so two frames of
-            // the same answer cannot interleave and lose the first half of the reply.
-            const { settleMs } = this.#settingsNow();
-            entry.timer = setTimeout(() => {
-                void this.#flushReply(sessionId);
-            }, settleMs);
-            entry.timer.unref?.();
-            this.#replies.set(sessionId, entry);
-        })();
+        if (this.#disposed) {
+            this.#holdLateText(turnKey, text);
+            return;
+        }
+        this.#pendingText.set(turnKey, (this.#pendingText.get(turnKey) ?? '') + text);
+        state.lastActivityAt = Date.now();
+        // ending 后仍可能收到迟到帧：保留 pending 并重新排期（不是“立即发送”的证明）。
+        if (state.status === 'ending')
+            this.#scheduleFinalize(sessionId, turn);
     }
-    /** Send and clear the buffered reply for a session. */
-    async #flushReply(sessionId) {
-        const entry = this.#replies.get(sessionId);
+    #holdLateText(turnKey, text) {
+        this.#persistFailedReply(turnKey, text, 'late text without live turn');
+    }
+    /**
+     * 结束条件：turn/end 已到（endedAt）且 activeAttempts 为空，再等 FINALIZE_GRACE_MS
+     * 让迟到帧进入 pending；然后单飞执行 finalize。
+     */
+    #scheduleFinalize(sessionId, turn) {
+        const key = this.#turnKey(sessionId, turn);
+        if (this.#disposed || this.#finalizeScheduled.has(key))
+            return;
+        const state = this.#turns.get(key);
+        if (state === undefined || state.status !== 'ending' || state.endedAt === undefined)
+            return;
+        if (state.activeAttempts.size > 0)
+            return;
+        this.#finalizeScheduled.add(key);
+        const timer = setTimeout(() => {
+            this.#finalizeScheduled.delete(key);
+            void this.#runFinalize(sessionId, turn);
+        }, 300);
+        timer.unref?.();
+    }
+    #runFinalize(sessionId, turn) {
+        const key = this.#turnKey(sessionId, turn);
+        const existing = this.#finalizing.get(key);
+        if (existing !== undefined)
+            return existing;
+        const task = (async () => {
+            try {
+                await this.#finalizeTurn(sessionId, turn);
+            }
+            catch (error) {
+                this.#recordError(`turn finalize failed: ${String(error)}`);
+            }
+            finally {
+                this.#finalizing.delete(key);
+                const state = this.#turns.get(key);
+                if (state !== undefined && state.status === 'ending') {
+                    state.finalizedAt = Date.now();
+                    this.#schedulePurge(key);
+                }
+                if (!this.#disposed && (this.#pendingText.get(key) ?? '') !== '')
+                    this.#scheduleFinalize(sessionId, turn);
+            }
+        })();
+        this.#finalizing.set(key, task);
+        void task.catch((error) => this.#recordError(`finalize task failed: ${String(error)}`));
+        return task;
+    }
+    /** finalize：await 之后反复检查 disposed；文本所有权从 pending 转移给 reply/outbox。 */
+    async #finalizeTurn(sessionId, turn) {
+        const key = this.#turnKey(sessionId, turn);
+        const state = this.#turns.get(key);
+        if (state === undefined) {
+            const orphan = this.#pendingText.get(key) ?? '';
+            this.#pendingText.delete(key);
+            if (orphan !== '')
+                this.#persistFailedReply(key, orphan, 'turn state missing at finalize');
+            return;
+        }
+        const wechatOnly = state.channels.size === 1 && state.channels.has('wechat');
+        if (!wechatOnly) {
+            this.#pendingText.delete(key);
+            this.#replies.delete(key);
+            return;
+        }
+        const pending = this.#pendingText.get(key) ?? '';
+        this.#pendingText.delete(key);
+        if (pending.trim() === '') {
+            return;
+        }
+        if (this.#disposed) {
+            this.#persistFailedReply(key, pending, 'disposed at finalize entry');
+            return;
+        }
+        let conversationId;
+        try {
+            const bindings = (await this.#store.read()).bindings;
+            if (this.#disposed) {
+                this.#persistFailedReply(key, pending, 'disposed after binding lookup');
+                return;
+            }
+            const conversation = Object.values(bindings).find((entry) => entry.sessionId === sessionId);
+            conversationId = conversation?.conversationId;
+        }
+        catch (error) {
+            this.#persistFailedReply(key, pending, `binding lookup failed: ${String(error)}`);
+            return;
+        }
+        if (conversationId === undefined) {
+            this.#persistFailedReply(key, pending, 'no binding at finalize');
+            return;
+        }
+        if (this.#disposed) {
+            this.#persistFailedReply(key, pending, 'disposed before reply entry');
+            return;
+        }
+        const entry = this.#replies.get(key) ?? {
+            conversationId, text: '', timer: undefined, flushing: undefined, dirty: false, inFlightText: undefined,
+        };
+        entry.conversationId = conversationId;
+        entry.text += pending;
+        this.#replies.set(key, entry);
+        await this.#flushReply(key);
+    }
+    /** per-turn single-flight flush；inFlightText 明确当前批次所有权。 */
+    async #flushReply(turnKey) {
+        const entry = this.#replies.get(turnKey);
         if (entry === undefined)
             return;
-        this.#replies.delete(sessionId);
-        const text = entry.text.trim();
-        if (text === '')
-            return;
-        const state = await this.#store.read();
-        const binding = state.bindings[entry.conversationId];
-        if (binding === undefined) {
-            /*
-             * The answer is thrown away, and this is the only record of it.
-             *
-             * It reaches here when the conversation lost its binding between the turn starting and the
-             * answer arriving — a disconnect, or the account being forgotten. The reply is already the
-             * finished work of a whole turn, so silence here is the most expensive kind: the user asked,
-             * the model answered, and nothing anywhere says where the answer went.
-             */
-            this.#recordError(`reply dropped: conversation ${entry.conversationId} has no binding ` +
-                `(session=${sessionId} text=${String(text.length)} chars)`);
+        if (entry.flushing !== undefined) {
+            entry.dirty = true;
+            return entry.flushing;
+        }
+        entry.flushing = (async () => {
+            while (true) {
+                const batch = entry.text;
+                entry.text = '';
+                if (batch.trim() === '')
+                    break;
+                entry.inFlightText = batch;
+                let ok = false;
+                try {
+                    ok = await this.#sendTurnReply(entry.conversationId, batch);
+                }
+                catch (error) {
+                    this.#recordError(`flush send exception: ${String(error)}`);
+                    ok = false;
+                }
+                entry.inFlightText = undefined;
+                if (!ok) {
+                    // 批次所有权从 inFlight 转给 outbox（或落盘），绝不丢。
+                    if (this.#disposed)
+                        this.#persistFailedReply(turnKey, batch, 'disposed during flush');
+                    else
+                        this.#enqueueOutbox(turnKey, entry.conversationId, batch);
+                }
+                if (entry.text.trim() === '')
+                    break;
+            }
+            entry.flushing = undefined;
+            if (entry.text.trim() === '' && !this.#outbox.has(turnKey)) {
+                this.#replies.delete(turnKey);
+            }
+            else if (entry.text.trim() !== '' && !this.#disposed) {
+                const timer = setTimeout(() => {
+                    void this.#flushReply(turnKey);
+                }, 0);
+                timer.unref?.();
+            }
+            this.#maybePurgeTurn(turnKey);
+        })();
+        entry.flushing = entry.flushing.catch((error) => {
+            entry.flushing = undefined;
+            // 合并保存：inFlight 批次 + 发送期间新追加的 entry.text，只落盘一次。
+            const inFlight = entry.inFlightText ?? '';
+            const queued = entry.text ?? '';
+            entry.inFlightText = undefined;
+            entry.text = '';
+            const lost = inFlight + queued;
+            if (lost !== '')
+                this.#persistFailedReply(turnKey, lost, `flush rejected: ${String(error)}`);
+            if (!this.#outbox.has(turnKey))
+                this.#replies.delete(turnKey);
+            this.#maybePurgeTurn(turnKey);
+        });
+        return entry.flushing;
+    }
+    async #sendTurnReply(conversationId, text) {
+        try {
+            const state = await this.#store.read();
+            const binding = state.bindings[conversationId];
+            if (binding === undefined) {
+                this.#recordError(`reply failed: conversation ${conversationId} has no binding`);
+                return false;
+            }
+            const account = state.accounts[binding.accountId];
+            if (account === undefined) {
+                this.#recordError(`reply failed: account ${binding.accountId} is no longer stored`);
+                return false;
+            }
+            const result = await this.#reply(account, binding.conversationId, binding.peerId, text);
+            if (result === true)
+                return true;
+            this.#recordError(`reply failed: #reply returned ${String(result)} (conversation=${conversationId})`);
+            return false;
+        }
+        catch (error) {
+            this.#recordError(`reply failed: ${String(error)}`);
+            return false;
+        }
+    }
+    #enqueueOutbox(turnKey, conversationId, text) {
+        if (this.#disposed) {
+            this.#persistFailedReply(turnKey, text, 'disposed before outbox');
             return;
         }
-        const account = state.accounts[binding.accountId];
-        if (account === undefined) {
-            this.#recordError(`reply dropped: account ${binding.accountId} is no longer stored ` +
-                `(conversation=${entry.conversationId} session=${sessionId} text=${String(text.length)} chars)`);
+        const existing = this.#outbox.get(turnKey);
+        const entry = existing ?? { conversationId, text: '', attempts: 0, timer: undefined, flushing: undefined, dirty: false, inFlightText: undefined };
+        entry.conversationId = conversationId;
+        const combined = entry.text + text;
+        if (combined.length > 20000) {
+            if (entry.flushing !== undefined) {
+                // 在途批次不能被摘出 Map；新增的超限文本独立落盘，原 entry.text/inFlightText 所有权不变。
+                this.#persistFailedReply(turnKey, text, 'outbox overflow while sending');
+                return;
+            }
+            this.#persistFailedReply(turnKey, combined, 'outbox overflow (20000 chars)');
+            this.#outbox.delete(turnKey);
             return;
         }
-        await this.#reply(account, binding.conversationId, binding.peerId, text);
+        entry.text = combined;
+        this.#outbox.set(turnKey, entry);
+        // 发送循环直接检查 entry.text，不依赖 dirty 标志；正在发送时也会消费新增文本。
+        if (entry.flushing === undefined)
+            this.#scheduleOutbox(turnKey);
+    }
+    #scheduleOutbox(turnKey) {
+        if (this.#disposed)
+            return;
+        const entry = this.#outbox.get(turnKey);
+        if (entry === undefined || entry.timer !== undefined || entry.flushing !== undefined)
+            return;
+        const delay = Math.min(30000 * (entry.attempts + 1), 5 * 60 * 1000);
+        entry.timer = setTimeout(() => {
+            entry.timer = undefined;
+            void this.#flushOutbox(turnKey);
+        }, delay);
+        entry.timer.unref?.();
+    }
+    async #flushOutbox(turnKey) {
+        const entry = this.#outbox.get(turnKey);
+        if (entry === undefined)
+            return;
+        if (entry.flushing !== undefined) {
+            // 已有发送循环；新增文本留在 entry.text，循环下一轮取走。
+            return entry.flushing;
+        }
+        entry.flushing = (async () => {
+            while (true) {
+                const batch = entry.text;
+                entry.text = '';
+                if (batch.trim() === '')
+                    break;
+                entry.inFlightText = batch;
+                let ok = false;
+                try {
+                    ok = await this.#sendTurnReply(entry.conversationId, batch);
+                }
+                catch (error) {
+                    this.#recordError(`outbox send exception: ${String(error)}`);
+                    ok = false;
+                }
+                // 发送结果一确认就结算 inFlightText；后续清理即使抛错，也不能把已成功的批次当未发送恢复。
+                entry.inFlightText = undefined;
+                if (ok) {
+                    entry.attempts = 0;
+                    this.#cleanupEmptyReply(turnKey);
+                    if (entry.text.trim() !== '')
+                        continue;
+                    break;
+                }
+                entry.attempts += 1;
+                entry.text = batch + entry.text;
+                if (this.#disposed) {
+                    this.#persistFailedReply(turnKey, entry.text, 'disposed during outbox');
+                    this.#outbox.delete(turnKey);
+                    entry.flushing = undefined;
+                    return;
+                }
+                if (entry.attempts > 20) {
+                    this.#persistFailedReply(turnKey, entry.text, 'outbox retry exhausted (20)');
+                    this.#outbox.delete(turnKey);
+                    entry.flushing = undefined;
+                    return;
+                }
+                this.#scheduleOutbox(turnKey);
+                break;
+            }
+            entry.flushing = undefined;
+            this.#cleanupEmptyReply(turnKey);
+            if (entry.text.trim() === '' && entry.attempts === 0)
+                this.#outbox.delete(turnKey);
+            else if (entry.text.trim() !== '' && entry.timer === undefined && !this.#disposed)
+                this.#scheduleOutbox(turnKey);
+            this.#maybePurgeTurn(turnKey);
+        })();
+        entry.flushing = entry.flushing.catch((error) => {
+            entry.flushing = undefined;
+            // 合并保存：inFlight 批次 + 发送期间新追加的 entry.text，只落盘一次。
+            const inFlight = entry.inFlightText ?? '';
+            const queued = entry.text ?? '';
+            entry.inFlightText = undefined;
+            entry.text = '';
+            const lost = inFlight + queued;
+            if (lost !== '')
+                this.#persistFailedReply(turnKey, lost, `outbox rejected: ${String(error)}`);
+            if (this.#outbox.get(turnKey) === entry)
+                this.#outbox.delete(turnKey);
+            this.#cleanupEmptyReply(turnKey);
+            this.#maybePurgeTurn(turnKey);
+        });
+        return entry.flushing;
+    }
+    #cleanupEmptyReply(turnKey) {
+        const reply = this.#replies.get(turnKey);
+        if (reply !== undefined && reply.flushing === undefined && reply.text.trim() === '')
+            this.#replies.delete(turnKey);
+    }
+    /**
+     * dispose 边界：同步 disposer 无法 await。保证：
+     * - 已发送批次不重复（inFlight 期间不接手）；
+     * - 未发送文本各发送一次，失败落盘；
+     * - 在途 finalize/flush 完成后由回调处理剩余文本；
+     * - 不保证进程退出前送达。
+     */
+    shutdown() {
+        this.#disposed = true;
+        if (this.#purgeTimer !== undefined) {
+            clearInterval(this.#purgeTimer);
+            this.#purgeTimer = undefined;
+        }
+        const finish = (turnKey, text, conversationId) => {
+            if (text.trim() === '')
+                return;
+            void this.#sendTurnReply(conversationId, text).then((ok) => {
+                if (!ok)
+                    this.#persistFailedReply(turnKey, text, 'shutdown send failed');
+            }).catch((error) => {
+                this.#persistFailedReply(turnKey, text, `shutdown send error: ${String(error)}`);
+            });
+        };
+        for (const task of [...this.#finalizing.values()]) {
+            void task.then(() => {
+                for (const [key, text] of [...this.#pendingText]) {
+                    this.#pendingText.delete(key);
+                    this.#persistFailedReply(key, text, 'shutdown leftover after finalize');
+                }
+            }).catch(() => { });
+        }
+        for (const [turnKey, entry] of [...this.#replies]) {
+            if (entry.timer !== undefined)
+                clearTimeout(entry.timer);
+            if (entry.flushing !== undefined) {
+                void entry.flushing.then(() => {
+                    const rest = entry.text;
+                    entry.text = '';
+                    finish(turnKey, rest, entry.conversationId);
+                }).catch(() => { });
+                continue;
+            }
+            const text = entry.text;
+            entry.text = '';
+            finish(turnKey, text, entry.conversationId);
+        }
+        for (const [turnKey, entry] of [...this.#outbox]) {
+            if (entry.timer !== undefined)
+                clearTimeout(entry.timer);
+            if (entry.flushing !== undefined) {
+                void entry.flushing.then(() => {
+                    const rest = entry.text;
+                    entry.text = '';
+                    finish(turnKey, rest, entry.conversationId);
+                }).catch(() => { });
+                continue;
+            }
+            const text = entry.text;
+            entry.text = '';
+            finish(turnKey, text, entry.conversationId);
+        }
+        for (const [turnKey, text] of [...this.#pendingText]) {
+            this.#pendingText.delete(turnKey);
+            this.#persistFailedReply(turnKey, text, 'shutdown pending text');
+        }
+        this.#retryEmergencyHold();
+        this.#retryOrphanText();
+        this.stopTypingAll();
+        this.#turns.clear();
+        this.#attempts.clear();
+        this.#calls.clear();
+        this.#approvals.clear();
+        this.#rpcSessions.clear();
     }
     /** Flush everything still buffered. Used on shutdown. */
     async flushReplies() {
-        for (const sessionId of [...this.#replies.keys()]) {
-            const entry = this.#replies.get(sessionId);
-            if (entry !== undefined)
+        for (const turnKey of [...this.#replies.keys()]) {
+            const entry = this.#replies.get(turnKey);
+            if (entry !== undefined && entry.timer !== undefined)
                 clearTimeout(entry.timer);
-            await this.#flushReply(sessionId);
+            await this.#flushReply(turnKey);
         }
     }
     /**
@@ -3083,6 +3847,72 @@ class WechatRuntime {
     }
     async #account(accountId) {
         return (await this.#store.read()).accounts[accountId];
+    }
+    /**
+     * 落盘一批失败文本；返回“本批次是否成功落盘”。
+     * 写入、rename、日志三个阶段隔离：write 不成功不 rename；rename 成功后日志失败不影响结果。
+     */
+    #persistFailedReply(turnKey, text, reason, holdOnFailure = true) {
+        if (text === '')
+            return false;
+        const name = `${String(turnKey).replace(/[^a-zA-Z0-9#_-]/g, '_')}-${String(process.pid)}-${randomUUID()}.txt`;
+        const payload = `turnKey: ${turnKey}\nreason: ${reason}\n\n${text}\n`;
+        for (const dir of [join(this.#home, 'failed-replies'), join(process.env.TEMP ?? this.#home, 'dsh-wechat-failed')]) {
+            try {
+                mkdirSync(dir, { recursive: true });
+            }
+            catch {
+                continue; // 目录创建失败：尝试下一个目录
+            }
+            const tmp = join(dir, `${name}.tmp`);
+            try {
+                writeFileSync(tmp, payload, 'utf8');
+            }
+            catch {
+                continue; // 写入失败：禁止 rename 可能不完整的临时文件
+            }
+            try {
+                renameSync(tmp, join(dir, name));
+            }
+            catch {
+                try {
+                    renameSync(tmp, join(dir, name));
+                }
+                catch {
+                    continue; // 两次 rename 都失败：才尝试下一个目录
+                }
+            }
+            // 到这里 rename 已成功；日志异常不得改变落盘结果，也不得触发备用目录。
+            try {
+                this.#recordError(`failed reply persisted: ${join(dir, name)} (${reason})`);
+            }
+            catch {
+                // 日志异常忽略，落盘结果已成立
+            }
+            return true;
+        }
+        if (holdOnFailure) {
+            const existing = this.#emergencyHold.get(turnKey);
+            this.#emergencyHold.set(turnKey, {
+                text: (existing?.text ?? '') + text,
+                reason,
+            });
+            try {
+                this.#recordError(`failed reply held in memory (${reason}, ${String(text.length)} chars, turnKey=${turnKey})`);
+            }
+            catch {
+                // 日志异常忽略
+            }
+        }
+        return false;
+    }
+    #retryEmergencyHold() {
+        for (const [key, item] of [...this.#emergencyHold]) {
+            // 只有确认本批次成功落盘才删除；失败保留原记录，不重复拼接。
+            const ok = this.#persistFailedReply(key, item.text, item.reason, false);
+            if (ok && this.#emergencyHold.get(key) === item)
+                this.#emergencyHold.delete(key);
+        }
     }
     #recordError(message) {
         this.#errors.push(`${new Date().toISOString()} ${message}`);
@@ -3592,6 +4422,13 @@ export function apply(ctx, config = {}, internals = {}) {
                 global: true,
                 prepend: true,
             });
+            const detachSessionEvents = ctx.on('session/event', (session, event) => {
+                runtime.onSessionEvent(session, event);
+            }, { global: true });
+            const detachInboxClaimed = ctx.on('agent/inbox/claimed', (payload) => {
+                runtime.onInboxClaimed(payload);
+            }, { global: true });
+            runtime.startMaintenance();
             void (async () => {
                 try {
                     if (config.autoStart === true || (await runtime.enabled()))
@@ -3610,11 +4447,14 @@ export function apply(ctx, config = {}, internals = {}) {
                         detachApproval();
                     if (typeof detachQuestions === 'function')
                         detachQuestions();
+                    if (typeof detachSessionEvents === 'function')
+                        detachSessionEvents();
+                    if (typeof detachInboxClaimed === 'function')
+                        detachInboxClaimed();
                     detachRoutes();
                     if (typeof detachTool === 'function')
                         detachTool();
-                    runtime.stopTypingAll();
-                    void runtime.flushReplies();
+                    runtime.shutdown();
                     void runtime.halt();
                 }
                 catch (error) {

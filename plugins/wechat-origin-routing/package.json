@@ -1,6 +1,6 @@
 {
   "name": "dsh-wechat-plugin",
-  "version": "0.47.0-z77.4",
+  "version": "0.47.0-z77.10",
   "type": "module",
   "description": "WeChat channel for DeepSeek Harness: lock the PC, walk away, and drive the agent from your phone. No OpenClaw and no public IP required.",
   "keywords": [
@@ -15,13 +15,13 @@
     "plugin",
     "remote-control"
   ],
-  "homepage": "https://github.com/famdic1903-hash/dsh-hub",
+  "homepage": "https://github.com/xcisxc29/dsh-wechat#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/famdic1903-hash/dsh-hub.git"
+    "url": "git+https://github.com/xcisxc29/dsh-wechat.git"
   },
   "bugs": {
-    "url": "https://github.com/famdic1903-hash/dsh-hub/issues"
+    "url": "https://github.com/xcisxc29/dsh-wechat/issues"
   },
   "main": "lib/host.js",
   "types": "lib/host.d.ts",
@@ -68,6 +68,5 @@
       "platform": "web",
       "immediately": true
     }
-  },
-  "author": "z77"
+  }
 }
